@@ -1,0 +1,106 @@
+<!-- NEW_FILE_CODE -->
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>瞳孔跟踪系统 - Pupil Tracking System</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>👁️ 瞳孔跟踪系统</h1>
+            <p class="subtitle">基于 ConvLSTM 和卡尔曼滤波的实时瞳孔检测与跟踪</p>
+        </header>
+
+        <main>
+            <!-- 上传区域 -->
+            <section class="upload-section">
+                <div class="upload-area" id="uploadArea">
+                    <div class="upload-icon">📹</div>
+                    <h3>拖拽视频到此处或点击上传</h3>
+                    <p>支持格式：MP4, AVI, MOV, MKV, FLV (最大 500MB)</p>
+                    <input type="file" id="videoInput" accept="video/*" style="display: none;">
+                    <button class="btn btn-primary" onclick="document.getElementById('videoInput').click()">
+                        选择视频文件
+                    </button>
+                </div>
+            </section>
+
+            <!-- 配置选项 -->
+            <section class="config-section" id="configSection" style="display: none;">
+                <h3>处理配置</h3>
+                <div class="config-options">
+                    <label class="checkbox-label">
+                        <input type="checkbox" id="useKalman" checked>
+                        <span>启用卡尔曼滤波跟踪（推荐）</span>
+                    </label>
+                </div>
+                <button class="btn btn-success" id="processBtn">
+                    🚀 开始处理
+                </button>
+            </section>
+
+            <!-- 处理进度 -->
+            <section class="progress-section" id="progressSection" style="display: none;">
+                <h3>处理进度</h3>
+                <div class="progress-container">
+                    <div class="progress-bar">
+                        <div class="progress-fill" id="progressFill"></div>
+                    </div>
+                    <p id="progressText">正在初始化...</p>
+                </div>
+            </section>
+
+            <!-- 结果展示 -->
+            <section class="result-section" id="resultSection" style="display: none;">
+                <h3>处理完成</h3>
+
+                <div class="stats-grid">
+                    <div class="stat-card">
+                        <div class="stat-value" id="totalFrames">0</div>
+                        <div class="stat-label">总帧数</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-value" id="trackedFrames">0</div>
+                        <div class="stat-label">跟踪帧数</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-value" id="successRate">0%</div>
+                        <div class="stat-label">成功率</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-value" id="lostFrames">0</div>
+                        <div class="stat-label">丢失帧数</div>
+                    </div>
+                </div>
+
+                <div class="action-buttons">
+                    <a id="downloadLink" class="btn btn-primary btn-large">
+                        📥 下载处理后的视频
+                    </a>
+                    <button class="btn btn-secondary" onclick="location.reload()">
+                        🔄 处理另一个视频
+                    </button>
+                </div>
+            </section>
+
+            <!-- 错误提示 -->
+            <section class="error-section" id="errorSection" style="display: none;">
+                <h3>❌ 处理失败</h3>
+                <p id="errorMessage"></p>
+                <button class="btn btn-secondary" onclick="location.reload()">
+                    重试
+                </button>
+            </section>
+        </main>
+
+        <footer>
+            <p>基于 ConvLSTM + 卡尔曼滤波的瞳孔跟踪系统 | 毕业设计项目</p>
+        </footer>
+    </div>
+
+    <script src="{{ url_for('static', filename='js/main.js') }}"></script>
+</body>
+</html>

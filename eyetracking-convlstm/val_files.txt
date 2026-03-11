@@ -1,2 +1,14 @@
-subj_16_vid_1
-subj_18_vid_7
+subj_5_vid_11
+subj_5_vid_6
+subj_6_vid_13
+subj_6_vid_2
+subj_6_vid_5
+subj_7_vid_15
+subj_7_vid_18
+subj_7_vid_21
+subj_8_vid_2
+subj_8_vid_7
+subj_8_vid_9
+subj_9_vid_16
+subj_9_vid_17
+subj_9_vid_18
