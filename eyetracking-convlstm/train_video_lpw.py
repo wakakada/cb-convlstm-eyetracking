@@ -124,7 +124,8 @@ class SmoothPupilTrackerModel(PupilTrackerModel):
 if __name__ == "__main__":
     # LPW 数据集路径
     lpw_root = "E:\school\毕设\convlstm-eyetracking\LPW"
-    # lpw_root = "/root/autodl-tmp/LPW/"
+    # lpw_root = "/root/autodl-tmp/LPW/"    # autodl
+    # lpw_root = "./CloudData/LPW"          # AI galaxy
     train_list = "train_files.txt"
     val_list = "val_files.txt"
 
@@ -147,7 +148,7 @@ if __name__ == "__main__":
     optimizer = optim.Adam(model.parameters(), lr=LR)
 
     # 学习率调度器
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5f)
     # 添加平滑损失权重
     smooth_weight = 0.1
 
