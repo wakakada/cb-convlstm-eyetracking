@@ -123,11 +123,11 @@ class SmoothPupilTrackerModel(PupilTrackerModel):
 
 if __name__ == "__main__":
     # LPW 数据集路径
-    lpw_root = "E:\school\毕设\convlstm-eyetracking\LPW"
+    # lpw_root = "E:\school\毕设\convlstm-eyetracking\LPW"
     # lpw_root = "/root/autodl-tmp/LPW/"    # autodl
-    # lpw_root = "./CloudData/LPW"          # AI galaxy
-    train_list = "train_files.txt"
-    val_list = "val_files.txt"
+    lpw_root = "/root/cb-convlstm-eyetracking/CloudData/LPW"          # AI galaxy
+    train_list = "/root/cb-convlstm-eyetracking/eyetracking-convlstm/train_files.txt"
+    val_list = "/root/cb-convlstm-eyetracking/eyetracking-convlstm/val_files.txt"
 
     # 创建数据集
     train_dataset = LPWDataset(lpw_root, train_list, seq_len=SEQ_LEN, stride=1, img_size=(HEIGHT, WIDTH), dataset_type="train")
@@ -148,7 +148,7 @@ if __name__ == "__main__":
     optimizer = optim.Adam(model.parameters(), lr=LR)
 
     # 学习率调度器
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5f)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
     # 添加平滑损失权重
     smooth_weight = 0.1
 
@@ -194,7 +194,7 @@ if __name__ == "__main__":
 
         epoch_loss = total_loss / len(train_loader)
         avg_smooth_loss = total_smooth_loss / len(train_loader)
-        print(f"Epoch [{epoch + 1}/{NUM_EPOCHS}], Train Loss: {epoch_loss:.4f}, Smooth_loss/len(train_loader):.4f")
+        print(f"Epoch [{epoch + 1}/{NUM_EPOCHS}], Train Loss: {epoch_loss:.4f}, Smooth_loss: {avg_smooth_loss:.4f}")
 
         # 记录训练历史
         history['train_loss'].append(epoch_loss)
