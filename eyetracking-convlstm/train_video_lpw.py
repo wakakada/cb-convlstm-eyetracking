@@ -11,9 +11,9 @@ import numpy as np
 from torch.cuda.amp import autocast, GradScaler
 
 # --- 配置 ---
-HEIGHT, WIDTH = 60, 80
+HEIGHT, WIDTH = 45, 60
 SEQ_LEN = 40
-BATCH_SIZE = 16
+BATCH_SIZE = 32
 NUM_EPOCHS = 50
 LR = 0.001
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
