@@ -148,7 +148,7 @@ if __name__ == "__main__":
     optimizer = optim.Adam(model.parameters(), lr=LR)
 
     # 学习率调度器
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5f)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
     # 添加平滑损失权重
     smooth_weight = 0.1
 
