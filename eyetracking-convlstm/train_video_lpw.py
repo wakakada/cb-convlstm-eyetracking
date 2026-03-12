@@ -8,6 +8,7 @@ import tqdm
 import os
 import matplotlib.pyplot as plt
 import numpy as np
+from torch.cuda.amp import autocast, GradScaler
 
 # --- 配置 ---
 HEIGHT, WIDTH = 60, 80
@@ -123,17 +124,20 @@ class SmoothPupilTrackerModel(PupilTrackerModel):
 
 if __name__ == "__main__":
     # LPW 数据集路径
-    # lpw_root = "E:\school\毕设\convlstm-eyetracking\LPW"
     # lpw_root = "/root/autodl-tmp/LPW/"    # autodl
-    lpw_root = "/root/cb-convlstm-eyetracking/CloudData/LPW"          # AI galaxy
-    train_list = "/root/cb-convlstm-eyetracking/eyetracking-convlstm/train_files.txt"
-    val_list = "/root/cb-convlstm-eyetracking/eyetracking-convlstm/val_files.txt"
+    lpw_root = "E:\school\毕设\convlstm-eyetracking\LPW"
+    train_list = "train_files.txt"
+    val_list = "val_files.txt"
+
+    # lpw_root = "/root/cb-convlstm-eyetracking/CloudData/LPW"          # AI galaxy
+    # train_list = "/root/cb-convlstm-eyetracking/eyetracking-convlstm/train_files.txt"
+    # val_list = "/root/cb-convlstm-eyetracking/eyetracking-convlstm/val_files.txt"
 
     # 创建数据集
     train_dataset = LPWDataset(lpw_root, train_list, seq_len=SEQ_LEN, stride=1, img_size=(HEIGHT, WIDTH), dataset_type="train")
     val_dataset = LPWDataset(lpw_root, val_list, seq_len=SEQ_LEN, stride=SEQ_LEN, img_size=(HEIGHT, WIDTH), dataset_type="val")
 
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=4, pin_memory=True)
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=8, pin_memory=True)
     val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=0, pin_memory=True)
 
     # 初始化模型
@@ -149,6 +153,7 @@ if __name__ == "__main__":
 
     # 学习率调度器
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
+    scaler = GradScaler()
     # 添加平滑损失权重
     smooth_weight = 0.1
 
@@ -171,30 +176,38 @@ if __name__ == "__main__":
         total_loss = 0
         total_smooth_loss = 0
 
-        for batch_x, batch_y in tqdm.tqdm(train_loader, desc=f"Epoch {epoch + 1}/{NUM_EPOCHS}", leave=False):
-            batch_x = batch_x.to(DEVICE).float()
-            batch_y = batch_y.to(DEVICE).float()
-
+        # 替换原来的训练循环内部
+        pbar = tqdm.tqdm(train_loader, desc=f"Epoch {epoch + 1}/{NUM_EPOCHS}", leave=False)
+        for batch_x, batch_y in pbar:
+            batch_x = batch_x.to(DEVICE, non_blocking=True)
+            batch_y = batch_y.to(DEVICE, non_blocking=True)
             optimizer.zero_grad()
-            outputs = model(batch_x)
-            # 基础检测损失
-            detection_loss = criterion(outputs, batch_y)
-            # 平滑性约束损失
-            if isinstance(model, SmoothPupilTrackerModel):
-                smooth_loss = model.smoothness_loss(outputs)
-                total_loss_value = detection_loss + smooth_weight * smooth_loss
-                total_smooth_loss += smooth_loss.item()
-            else:
-                total_loss_value = detection_loss
 
-            total_loss_value.backward()
-            optimizer.step()
+            # 混合精度训练
+            with autocast():
+                outputs = model(batch_x)
+                detection_loss = criterion(outputs, batch_y)
+
+                if isinstance(model, SmoothPupilTrackerModel):
+                    smooth_loss = model.smoothness_loss(outputs)
+                    total_loss_value = detection_loss + smooth_weight * smooth_loss
+                    total_smooth_loss += smooth_loss.item()
+                else:
+                    total_loss_value = detection_loss
+
+            # 缩放梯度反向传播
+            scaler.scale(total_loss_value).backward()
+            scaler.step(optimizer)
+            scaler.update()
 
             total_loss += detection_loss.item()
+            # 更新进度条
+            pbar.set_postfix({'loss': f'{total_loss / (pbar.n + 1):.4f}'})
 
         epoch_loss = total_loss / len(train_loader)
         avg_smooth_loss = total_smooth_loss / len(train_loader)
-        print(f"Epoch [{epoch + 1}/{NUM_EPOCHS}], Train Loss: {epoch_loss:.4f}, Smooth_loss: {avg_smooth_loss:.4f}")
+        print(f"\nEpoch [{epoch + 1}/{NUM_EPOCHS}]")
+        print(f"  Train Loss: {epoch_loss:.6f}, Smooth Loss: {avg_smooth_loss:.6f}")
 
         # 记录训练历史
         history['train_loss'].append(epoch_loss)
