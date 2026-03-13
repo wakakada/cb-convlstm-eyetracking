@@ -1,4 +1,4 @@
-# NEW_FILE_CODE
+import threading
 from flask import Flask, render_template, request, send_file, jsonify
 from werkzeug.utils import secure_filename
 import os
@@ -9,6 +9,7 @@ from train_video_lpw import PupilTrackerModel, HEIGHT, WIDTH, SEQ_LEN
 from kalman_tracker import AdaptiveKalmanTracker
 import uuid
 from datetime import datetime
+import sys
 
 app = Flask(__name__)
 
@@ -22,18 +23,47 @@ ALLOWED_EXTENSIONS = {'mp4', 'avi', 'mov', 'mkv', 'flv'}
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 os.makedirs(app.config['OUTPUT_FOLDER'], exist_ok=True)
 
+# 进度跟踪器
+progress_tracker = {}
+
 # 加载模型
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-MODEL_PATH = "pupil_tracker_lpw.pth"
+HEIGHT = 60
+WIDTH = 80
+MODEL_PATH = "E:\\school\\毕设\\convlstm-eyetracking\\cb-convlstm-eyetracking\\pupil_tracker_lpw.pth"
 
 
 def load_model():
     """加载训练好的模型"""
+    print(f"Loading model from: {MODEL_PATH}")
+    print(f"File exists: {os.path.exists(MODEL_PATH)}")
+    print(f"Using HEIGHT={HEIGHT}, WIDTH={WIDTH} (training dimensions)")
+
+    # 先创建模型实例
     model = PupilTrackerModel(HEIGHT, WIDTH).to(DEVICE)
+
+    # 预创建全连接层（与训练时保持一致）
+    dummy_input = torch.randn(1, SEQ_LEN, 1, HEIGHT, WIDTH).to(DEVICE)
+    with torch.no_grad():
+        _ = model(dummy_input)
+
+    # 检查 fc1_dyn 的输入维度
+    if hasattr(model, 'fc1_dyn') and model.fc1_dyn is not None:
+        print(f"fc1_dyn input shape: {model.fc1_dyn.in_features}", file=sys.stderr)
+        print(f"fc1_dyn output shape: {model.fc1_dyn.out_features}", file=sys.stderr)
+
+    # 现在加载权重
     checkpoint = torch.load(MODEL_PATH, map_location=DEVICE)
+
+    # 检查 checkpoint 中的形状
+    if 'fc1_dyn.weight' in checkpoint['model_state_dict']:
+        ckpt_shape = checkpoint['model_state_dict']['fc1_dyn.weight'].shape
+        print(f"Checkpoint fc1_dyn weight shape: {ckpt_shape}", file=sys.stderr)
+
     model.load_state_dict(checkpoint['model_state_dict'])
+
     model.eval()
-    print(f"Model loaded successfully on {DEVICE}")
+    print(f"✓ Model loaded successfully on {DEVICE}", file=sys.stderr)
     return model
 
 
@@ -45,7 +75,7 @@ def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
 
-def process_video(video_path, output_path, use_kalman=True):
+def process_video(video_path, output_path, use_kalman=True, task_id=None):
     """
     处理视频，进行瞳孔跟踪标注
 
@@ -53,6 +83,7 @@ def process_video(video_path, output_path, use_kalman=True):
         video_path: 输入视频路径
         output_path: 输出视频路径
         use_kalman: 是否使用卡尔曼滤波
+        task_id: 任务 ID（用于进度跟踪）
 
     Returns:
         dict: 处理统计信息
@@ -66,6 +97,10 @@ def process_video(video_path, output_path, use_kalman=True):
     orig_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
+    # 更新进度
+    if task_id:
+        progress_tracker[task_id]['total_frames'] = total_frames
+
     # 创建视频写入器
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     out = cv2.VideoWriter(output_path, fourcc, fps, (orig_w, orig_h))
@@ -75,6 +110,11 @@ def process_video(video_path, output_path, use_kalman=True):
 
     # 初始化卡尔曼跟踪器
     kalman_tracker = AdaptiveKalmanTracker(process_noise=0.1, measurement_noise=1.0) if use_kalman else None
+
+    # 瞳孔位置跟踪（持续更新）
+    current_pupil_x = orig_w / 2  # 初始位置在中心
+    current_pupil_y = orig_h / 2
+    pupil_detected = False
 
     # 统计信息
     stats = {
@@ -99,9 +139,9 @@ def process_video(video_path, output_path, use_kalman=True):
         frame_buffer.append(normalized)
 
         # 当缓冲区满时进行预测
-        if len(frame_buffer) == SEQ_LEN:
+        if len(frame_buffer) >= SEQ_LEN:
             # 构造输入 Tensor: (1, Seq, 1, H, W)
-            input_data = np.array(frame_buffer)
+            input_data = np.array(frame_buffer[-SEQ_LEN:])  # 只取最后 SEQ_LEN 帧
             input_data = np.expand_dims(input_data, axis=0)  # Batch=1
             input_data = np.expand_dims(input_data, axis=2)  # Channel=1
             input_tensor = torch.from_numpy(input_data).to(DEVICE).float()
@@ -168,7 +208,9 @@ def process_video(video_path, output_path, use_kalman=True):
                     cv2.putText(frame, status_text, (10, 95),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
 
-            # 添加进度条
+            # 移除第一帧，保持滑动窗口
+            frame_buffer.pop(0)
+
             progress = (frame_count / total_frames) * 100
             progress_bar_y = orig_h - 10
             progress_bar_width = int(orig_w * 0.3)
@@ -179,12 +221,14 @@ def process_video(video_path, output_path, use_kalman=True):
             cv2.putText(frame, f"{progress:.1f}%", (10 + progress_bar_width + 15, progress_bar_y - 5),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
 
-            # 移除第一帧，保持滑动窗口
-            frame_buffer.pop(0)
-
             out.write(frame)
             frame_count += 1
             stats['total_frames'] += 1
+
+            # 更新进度跟踪器 - 每帧都更新
+            if task_id:
+                progress_tracker[task_id]['current_frames'] = frame_count
+                progress_tracker[task_id]['progress'] = progress
 
             if frame_count % 100 == 0:
                 print(f"Processed {frame_count}/{total_frames} frames ({progress:.1f}%)")
@@ -230,6 +274,9 @@ def upload_video():
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         input_filename = f"{timestamp}_{unique_id}_{filename}"
 
+        # 生成任务 ID
+        task_id = f"{timestamp}_{unique_id}"
+
         # 保存上传文件
         input_path = os.path.join(app.config['UPLOAD_FOLDER'], input_filename)
         file.save(input_path)
@@ -238,18 +285,46 @@ def upload_video():
         output_filename = f"processed_{input_filename}"
         output_path = os.path.join(app.config['OUTPUT_FOLDER'], output_filename)
 
-        try:
-            # 处理视频
-            use_kalman = request.form.get('use_kalman', 'true').lower() == 'true'
-            stats = process_video(input_path, output_path, use_kalman)
+        # 提前获取表单数据（在线程外）
+        use_kalman = request.form.get('use_kalman', 'true').lower() == 'true'
 
-            # 返回结果
+        try:
+            # 初始化进度
+            progress_tracker[task_id] = {
+                'status': 'processing',
+                'progress': 0,
+                'current_frames': 0,
+                'total_frames': 0,
+                'error': None
+            }
+
+            # 异步处理视频
+            def process_in_background():
+                try:
+                    stats = process_video(input_path, output_path, use_kalman, task_id)
+
+                    progress_tracker[task_id] = {
+                        'status': 'completed',
+                        'progress': 100,
+                        'stats': stats,
+                        'download_url': f'/download/{output_filename}',
+                        'filename': output_filename
+                    }
+                except Exception as e:
+                    progress_tracker[task_id] = {
+                        'status': 'failed',
+                        'error': str(e)
+                    }
+
+            # 启动后台线程处理
+            thread = threading.Thread(target=process_in_background)
+            thread.start()
+
+            # 立即返回任务 ID
             return jsonify({
                 'success': True,
-                'message': 'Video processed successfully',
-                'download_url': f'/download/{output_filename}',
-                'stats': stats,
-                'filename': output_filename
+                'task_id': task_id,
+                'message': 'Video upload successful, processing started'
             })
 
         except Exception as e:
@@ -259,6 +334,16 @@ def upload_video():
             }), 500
     else:
         return jsonify({'error': 'File type not allowed'}), 400
+
+
+@app.route('/progress/<task_id>')
+def get_progress(task_id):
+    """获取处理进度"""
+    if task_id not in progress_tracker:
+        return jsonify({'error': 'Task not found'}), 404
+
+    progress_data = progress_tracker[task_id]
+    return jsonify(progress_data)
 
 
 @app.route('/download/<filename>')
