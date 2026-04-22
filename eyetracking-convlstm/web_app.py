@@ -28,9 +28,7 @@ progress_tracker = {}
 
 # 加载模型
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-HEIGHT = 60
-WIDTH = 80
-MODEL_PATH = "E:\\school\\毕设\\convlstm-eyetracking\\cb-convlstm-eyetracking\\pupil_tracker_lpw.pth"
+MODEL_PATH = os.path.join(os.path.dirname(__file__), '..', 'pupil_tracker_lpw.pth')
 
 
 def load_model():
@@ -42,7 +40,7 @@ def load_model():
     # 先创建模型实例
     model = PupilTrackerModel(HEIGHT, WIDTH).to(DEVICE)
 
-    # 预创建全连接层（与训练时保持一致）
+    # 预创建全连接层（与训练时保持一致）：构造一个随机虚拟输入通过模型一次，触发动态全连接层的创建（fc1_dyn和fc2_dyn会在第一次前向传播时根据特征尺寸自动实例化）
     dummy_input = torch.randn(1, SEQ_LEN, 1, HEIGHT, WIDTH).to(DEVICE)
     with torch.no_grad():
         _ = model(dummy_input)
@@ -52,7 +50,7 @@ def load_model():
         print(f"fc1_dyn input shape: {model.fc1_dyn.in_features}", file=sys.stderr)
         print(f"fc1_dyn output shape: {model.fc1_dyn.out_features}", file=sys.stderr)
 
-    # 现在加载权重
+    # 现在加载保存的模型权重文件（包含模型状态字典、优化器状态等）
     checkpoint = torch.load(MODEL_PATH, map_location=DEVICE)
 
     # 检查 checkpoint 中的形状
@@ -66,9 +64,8 @@ def load_model():
     print(f"✓ Model loaded successfully on {DEVICE}", file=sys.stderr)
     return model
 
-
+# 全局模型实例，应用启动时加载一次，所有请求共享该模型（线程安全，因为推理时使用torch.no_grad()且不修改参数）
 model = load_model()
-
 
 def allowed_file(filename):
     """检查文件扩展名是否允许"""
@@ -92,10 +89,10 @@ def process_video(video_path, output_path, use_kalman=True, task_id=None):
     if not cap.isOpened():
         raise ValueError("Error opening video")
 
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    orig_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    orig_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    fps = cap.get(cv2.CAP_PROP_FPS) # 读帧率
+    orig_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))     # 原始宽度
+    orig_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))    # 原始高度
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))# 总帧数
 
     # 更新进度
     if task_id:
@@ -105,27 +102,29 @@ def process_video(video_path, output_path, use_kalman=True, task_id=None):
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     out = cv2.VideoWriter(output_path, fourcc, fps, (orig_w, orig_h))
 
-    frame_buffer = []
-    frame_count = 0
+    frame_buffer = []   # 滑动窗口缓冲区，存储预处理后的连续帧（用于模型输入）
+    frame_count = 0     # 已处理帧计数器
 
     # 初始化卡尔曼跟踪器
     kalman_tracker = AdaptiveKalmanTracker(process_noise=0.1, measurement_noise=1.0) if use_kalman else None
-
-    # 瞳孔位置跟踪（持续更新）
-    current_pupil_x = orig_w / 2  # 初始位置在中心
-    current_pupil_y = orig_h / 2
-    pupil_detected = False
 
     # 统计信息
     stats = {
         'total_frames': 0,
         'processed_frames': 0,
         'tracked_frames': 0,
-        'lost_frames': 0
+        'lost_frames': 0,
+        'accurate_frames': 0,
+        'total_error': 0.0,
+        'errors': []
     }
 
     print(f"Processing video: {video_path}")
     print(f"Resolution: {orig_w}x{orig_h}, FPS: {fps}, Total frames: {total_frames}")
+
+    # 初始化变量
+    final_x, final_y = orig_w / 2, orig_h / 2
+    color = (0, 255, 0)
 
     while True:
         ret, frame = cap.read()
@@ -138,10 +137,11 @@ def process_video(video_path, output_path, use_kalman=True, task_id=None):
         normalized = resized.astype(np.float32) / 255.0
         frame_buffer.append(normalized)
 
-        # 当缓冲区满时进行预测
-        if len(frame_buffer) >= SEQ_LEN:
-            # 构造输入 Tensor: (1, Seq, 1, H, W)
-            input_data = np.array(frame_buffer[-SEQ_LEN:])  # 只取最后 SEQ_LEN 帧
+        # 只要有帧就进行预测（使用可用的帧数）
+        current_seq_len = min(len(frame_buffer), SEQ_LEN)
+        if current_seq_len > 0:
+            # 构造输入 Tensor
+            input_data = np.array(frame_buffer[-current_seq_len:])
             input_data = np.expand_dims(input_data, axis=0)  # Batch=1
             input_data = np.expand_dims(input_data, axis=2)  # Channel=1
             input_tensor = torch.from_numpy(input_data).to(DEVICE).float()
@@ -153,20 +153,31 @@ def process_video(video_path, output_path, use_kalman=True, task_id=None):
                 # 取最后一个时间步的预测作为当前帧的检测结果
                 detection_norm = prediction[0, -1].cpu().numpy()
 
-                # 还原到原始视频分辨率
+                # 调试输出：查看模型输出的实际范围
+                if frame_count < 10:
+                    print(f"Frame {frame_count}: Model output = [{detection_norm[0]:.4f}, {detection_norm[1]:.4f}]")
+
+                # 模型输出是相对于输入图像 (WIDTH x HEIGHT) 的坐标，需要映射到原始视频分辨率 (orig_w x orig_h)得到实际像素坐标
                 detection_x = detection_norm[0] * orig_w
                 detection_y = detection_norm[1] * orig_h
                 detection = (detection_x, detection_y)
 
-                # 默认置信度
-                confidence = 0.8 if frame_count > SEQ_LEN else 0.5
+                # 置信度：缓冲区越满，模型输入越完整，置信度越高(0.3~0.8)
+                confidence = 0.3 + (current_seq_len / SEQ_LEN) * 0.5
 
             # 使用卡尔曼滤波进行跟踪融合
             if use_kalman and kalman_tracker is not None:
-                tracked_pos, status = kalman_tracker.update(detection, confidence)
+                tracked_pos, status = kalman_tracker.update(detection, confidence)  # 获取滤波后位置和状态
 
                 if tracked_pos is not None:
                     final_x, final_y = tracked_pos
+
+                    # 检查卡尔曼输出是否越界
+                    if final_x < 0 or final_x > orig_w or final_y < 0 or final_y > orig_h:
+                        print(
+                            f"⚠️ Kalman output out of bounds: ({final_x:.1f}, {final_y:.1f}), using detection instead")
+                        final_x, final_y = detection_x, detection_y
+
                     stats['tracked_frames'] += 1
 
                     # 根据跟踪状态调整显示颜色
@@ -181,62 +192,79 @@ def process_video(video_path, output_path, use_kalman=True, task_id=None):
                     color = (0, 0, 255)
                     stats['lost_frames'] += 1
             else:
+                # 不启用卡尔曼滤波，直接使用检测坐标，颜色为绿色
                 final_x, final_y = detection_x, detection_y
                 color = (0, 255, 0)
                 stats['processed_frames'] += 1
 
-            # 绘制结果
-            final_x, final_y = int(final_x), int(final_y)
+            # 当缓冲区长度超过SEQ_LEN时，移除第一帧，保持滑动窗口
+            if len(frame_buffer) > SEQ_LEN:
+                frame_buffer.pop(0)
 
-            # 绘制瞳孔点
-            cv2.circle(frame, (final_x, final_y), 8, color, -1)
-            cv2.circle(frame, (final_x, final_y), 15, color, 2)
-            cv2.circle(frame, (final_x, final_y), 25, (255, 255, 255), 1)
+        # 调试输出：前 10 帧
+        if frame_count < 10:
+            print(
+                f"Frame {frame_count}: Video={orig_w}x{orig_h}, Pupil=({final_x:.1f}, {final_y:.1f}), Color={color}")
 
-            # 显示坐标和状态
-            info_text = f"Pupil: ({final_x}, {final_y})"
-            cv2.putText(frame, info_text, (10, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2)
+        # 绘制瞳孔标注
+        final_x, final_y = int(final_x), int(final_y)
 
-            if use_kalman and kalman_tracker is not None:
-                state = kalman_tracker.get_state()
-                if state:
-                    status_text = f"Status: {'Tracking' if state['tracking'] else 'Lost'}"
-                    vel = np.sqrt(state['velocity'][0] ** 2 + state['velocity'][1] ** 2)
-                    cv2.putText(frame, f"Vel: {vel:.1f}", (10, 65),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-                    cv2.putText(frame, status_text, (10, 95),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+        # 确保坐标在视频范围内（先检查再限制）
+        if final_x < 0:
+            final_x = 0
+        elif final_x >= orig_w:
+            final_x = orig_w - 1
 
-            # 移除第一帧，保持滑动窗口
-            frame_buffer.pop(0)
+        if final_y < 0:
+            final_y = 0
+        elif final_y >= orig_h:
+            final_y = orig_h - 1
 
-            progress = (frame_count / total_frames) * 100
-            progress_bar_y = orig_h - 10
-            progress_bar_width = int(orig_w * 0.3)
-            cv2.rectangle(frame, (10, progress_bar_y - 20),
-                          (10 + progress_bar_width, progress_bar_y), (50, 50, 50), -1)
-            cv2.rectangle(frame, (10, progress_bar_y - 20),
-                          (10 + int(progress_bar_width * progress / 100), progress_bar_y), (0, 255, 0), -1)
-            cv2.putText(frame, f"{progress:.1f}%", (10 + progress_bar_width + 15, progress_bar_y - 5),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        # 绘制瞳孔跟踪标注
+        # 内圈：半径 8 像素，实心
+        cv2.circle(frame, (final_x, final_y), 8, color, -1)
+        # 中圈：半径 15 像素，空心
+        cv2.circle(frame, (final_x, final_y), 15, color, 2)
+        # 外圈：半径 25 像素，空心，白色
+        cv2.circle(frame, (final_x, final_y), 25, (255, 255, 255), 1)
 
-            out.write(frame)
-            frame_count += 1
-            stats['total_frames'] += 1
+        # 绘制十字准星
+        cv2.line(frame, (final_x - 15, final_y), (final_x + 15, final_y), color, 2)
+        cv2.line(frame, (final_x, final_y - 15), (final_x, final_y + 15), color, 2)
 
-            # 更新进度跟踪器 - 每帧都更新
-            if task_id:
-                progress_tracker[task_id]['current_frames'] = frame_count
-                progress_tracker[task_id]['progress'] = progress
+        # 左上角显示当前瞳孔坐标
+        info_text = f"Pupil: ({final_x}, {final_y})"
+        cv2.putText(frame, info_text, (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2)
 
-            if frame_count % 100 == 0:
-                print(f"Processed {frame_count}/{total_frames} frames ({progress:.1f}%)")
+        # 在视频底部绘制一个宽度为视频宽30%的进度条，填充绿色表示当前进度，并显示百分比数字
+        progress = (frame_count / total_frames) * 100
+        progress_bar_y = orig_h - 10
+        progress_bar_width = int(orig_w * 0.3)
+        cv2.rectangle(frame, (10, progress_bar_y - 20),
+                      (10 + progress_bar_width, progress_bar_y), (50, 50, 50), -1)
+        cv2.rectangle(frame, (10, progress_bar_y - 20),
+                      (10 + int(progress_bar_width * progress / 100), progress_bar_y), (0, 255, 0), -1)
+        cv2.putText(frame, f"{progress:.1f}%", (10 + progress_bar_width + 15, progress_bar_y - 5),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+
+        out.write(frame)    # 将标注后的帧写入输出视频文件
+
+        frame_count += 1
+        stats['total_frames'] += 1
+
+        # 更新进度跟踪器 - 每帧都更新
+        if task_id:
+            progress_tracker[task_id]['current_frames'] = frame_count
+            progress_tracker[task_id]['progress'] = progress
+
+        if frame_count % 100 == 0:
+            print(f"Processed {frame_count}/{total_frames} frames ({progress:.1f}%)")
 
     cap.release()
     out.release()
 
-    # 计算统计信息
+    # 计算跟踪成功率
     if stats['total_frames'] > 0:
         stats['success_rate'] = stats['tracked_frames'] / stats['total_frames'] * 100
     else:
@@ -252,7 +280,7 @@ def process_video(video_path, output_path, use_kalman=True, task_id=None):
 
 @app.route('/')
 def index():
-    """主页"""
+    """前端上传界面"""
     return render_template('index.html')
 
 
@@ -316,7 +344,7 @@ def upload_video():
                         'error': str(e)
                     }
 
-            # 启动后台线程处理
+            # 启动一个独立线程处理process_in_background，避免阻塞Flask主线程
             thread = threading.Thread(target=process_in_background)
             thread.start()
 
@@ -338,17 +366,15 @@ def upload_video():
 
 @app.route('/progress/<task_id>')
 def get_progress(task_id):
-    """获取处理进度"""
+    """客户端通过task_id定期轮询此接口，获取当前处理状态、进度百分比等信息"""
     if task_id not in progress_tracker:
         return jsonify({'error': 'Task not found'}), 404
-
-    progress_data = progress_tracker[task_id]
-    return jsonify(progress_data)
+    return jsonify(progress_tracker[task_id])
 
 
 @app.route('/download/<filename>')
 def download_video(filename):
-    """下载处理后的视频"""
+    """前端可使用此路由下载处理后的视频"""
     file_path = os.path.join(app.config['OUTPUT_FOLDER'], filename)
     if os.path.exists(file_path):
         return send_file(file_path, as_attachment=True)
