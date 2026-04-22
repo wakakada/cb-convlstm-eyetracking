@@ -1,3 +1,4 @@
+# 瞳孔跟踪模型训练
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -8,29 +9,29 @@ import tqdm
 import os
 import matplotlib.pyplot as plt
 import numpy as np
-from torch.cuda.amp import autocast, GradScaler
+from torch.amp import autocast, GradScaler
 
 # --- 配置 ---
 HEIGHT, WIDTH = 45, 60
-SEQ_LEN = 40
-BATCH_SIZE = 32
+SEQ_LEN = 20
+BATCH_SIZE = 128
 NUM_EPOCHS = 50
 LR = 0.001
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+DEVICE = torch.device("cuda")
 
 # 早停配置
 EARLY_STOPPING_PATIENCE = 5         # 验证损失多少个epoch不下降就停止
 EARLY_STOPPING_MIN_DELTA = 0.0001   # 最小改善阈值
 
 
-# --- 模型定义 ---
+# 定义瞳孔跟踪的神经网络结构
 class PupilTrackerModel(nn.Module):
     def __init__(self, height, width, input_dim=1):
         super(PupilTrackerModel, self).__init__()
-        self.convlstm1 = ConvLSTM(input_dim=input_dim, hidden_dim=16, kernel_size=(3, 3), num_layers=1,
-                                  batch_first=True)
-        self.bn1 = nn.BatchNorm3d(16)
-        self.pool1 = nn.MaxPool3d(kernel_size=(1, 2, 2))
+        # 卷积长短期记忆网络，同时提取空间特征和时间依赖
+        self.convlstm1 = ConvLSTM(input_dim=input_dim, hidden_dim=16, kernel_size=(3, 3), num_layers=1, batch_first=True)
+        self.bn1 = nn.BatchNorm3d(16)   # 对3D特征图((batch, channel, seq, h, w))进行批归一化，加速收敛
+        self.pool1 = nn.MaxPool3d(kernel_size=(1, 2, 2))    # 3D最大池化，kernel_size=(1, 2, 2)，表示仅在空间维度(H, W)下采样2倍，时间维度保持不变
 
         self.convlstm2 = ConvLSTM(input_dim=16, hidden_dim=32, kernel_size=(3, 3), num_layers=1, batch_first=True)
         self.bn2 = nn.BatchNorm3d(32)
@@ -40,22 +41,18 @@ class PupilTrackerModel(nn.Module):
         self.bn3 = nn.BatchNorm3d(64)
         self.pool3 = nn.MaxPool3d(kernel_size=(1, 2, 2))
 
-        self.convlstm4 = ConvLSTM(input_dim=64, hidden_dim=64, kernel_size=(3, 3), num_layers=1, batch_first=True)
-        self.bn4 = nn.BatchNorm3d(64)
-        self.pool4 = nn.MaxPool3d(kernel_size=(1, 2, 2))
-
-        # 动态计算全连接输入维度
+        # 动态计算全连接输入维度，适用于输入尺寸可能变化的情况，确保模型的通用性和灵活性
         self.fc1_dyn = None
         self.fc2_dyn = None
 
     def forward(self, x):
-        x, _ = self.convlstm1(x)
-        x = x[0].permute(0, 2, 1, 3, 4)
+        x, _ = self.convlstm1(x)    # 返回一个元组(output, (h, c))
+        x = x[0].permute(0, 2, 1, 3, 4) # 将通道维与时间维交换->(batch, channels, seq, h, w)，这是BatchNorm3d和MaxPool3d期望的格式
         x = self.bn1(x)
         x = torch.relu(x)
         x = self.pool1(x)
 
-        x = x.permute(0, 2, 1, 3, 4)
+        x = x.permute(0, 2, 1, 3, 4)    # ->(batch, seq, channels, h, w)
         x, _ = self.convlstm2(x)
         x = x[0].permute(0, 2, 1, 3, 4)
         x = self.bn2(x)
@@ -69,38 +66,31 @@ class PupilTrackerModel(nn.Module):
         x = torch.relu(x)
         x = self.pool3(x)
 
-        x = x.permute(0, 2, 1, 3, 4)
-        x, _ = self.convlstm4(x)
-        x = x[0].permute(0, 2, 1, 3, 4)
-        x = self.bn4(x)
-        x = torch.relu(x)
-        x = self.pool4(x)
-
         B, C, T, H, W = x.size()
 
         outputs = []
         for t in range(T):
+            # 对每个时间步t，将当前时刻的特征图展平为一维向量(B, C*H*W)
             feat = x[:, :, t, :, :].reshape(B, -1)
-
             if self.fc1_dyn is None:
+                # 首次运行时，根据展平特征维度创建全连接层。fc1将特征映射到128维，fc2输出2个坐标（瞳孔中心的x，y）
                 self.fc1_dyn = nn.Linear(feat.size(1), 128).to(DEVICE)
                 self.fc2_dyn = nn.Linear(128, 2).to(DEVICE)
 
-            feat = torch.relu(self.fc1_dyn(feat))
+            feat = torch.relu(self.fc1_dyn(feat))   # 对每个时间步应用相同的全连接层（权值共享）
             feat = nn.Dropout(0.5)(feat)
             out = self.fc2_dyn(feat)
             outputs.append(out)
-
+        # 将所有时间步的输出堆叠并调整维度为(batch, seq, 2)，对应每帧的预测坐标
         y = torch.stack(outputs, dim=0).permute(1, 0, 2)
         return y
 
 
 class SmoothPupilTrackerModel(PupilTrackerModel):
-    """带轨迹平滑约束的瞳孔跟踪模型"""
-
+    """带轨迹平滑约束的瞳孔跟踪模型，添加轨迹平滑约束，用于鼓励模型预测坐标在时间上连续变化，减少抖动"""
     def __init__(self, height, width, input_dim=1, smooth_weight=0.1):
         super(SmoothPupilTrackerModel, self).__init__(height, width, input_dim)
-        self.smooth_weight = smooth_weight
+        self.smooth_weight = smooth_weight  # 平滑损失在总损失中的权重
 
     def smoothness_loss(self, outputs):
         """
@@ -125,20 +115,24 @@ class SmoothPupilTrackerModel(PupilTrackerModel):
 if __name__ == "__main__":
     # LPW 数据集路径
     # lpw_root = "/root/autodl-tmp/LPW/"    # autodl
-    lpw_root = "E:\school\毕设\convlstm-eyetracking\LPW"
-    train_list = "train_files.txt"
-    val_list = "val_files.txt"
+    # lpw_root = "E:\school\毕设\convlstm-eyetracking\LPW"
+    # train_list = "train_files.txt"
+    # val_list = "val_files.txt"
 
     # lpw_root = "/root/cb-convlstm-eyetracking/CloudData/LPW"          # AI galaxy
     # train_list = "/root/cb-convlstm-eyetracking/eyetracking-convlstm/train_files.txt"
     # val_list = "/root/cb-convlstm-eyetracking/eyetracking-convlstm/val_files.txt"
 
-    # 创建数据集
-    train_dataset = LPWDataset(lpw_root, train_list, seq_len=SEQ_LEN, stride=1, img_size=(HEIGHT, WIDTH), dataset_type="train")
-    val_dataset = LPWDataset(lpw_root, val_list, seq_len=SEQ_LEN, stride=SEQ_LEN, img_size=(HEIGHT, WIDTH), dataset_type="val")
+    lpw_root = os.path.join("/kaggle/input/datasets/wakakaele/eyetracking-lpw", "LPW")
+    train_list = os.path.join("/kaggle/input/models/wakakaele/eyetracking/pytorch/default/1", "train_files.txt")
+    val_list = os.path.join("/kaggle/input/models/wakakaele/eyetracking/pytorch/default/1", "val_files.txt")
 
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=8, pin_memory=True)
-    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=0, pin_memory=True)
+    # 创建数据集；stride：采样滑动窗口的步长
+    train_dataset = LPWDataset(lpw_root, train_list, seq_len=SEQ_LEN, stride=1, img_size=(HEIGHT, WIDTH), dataset_type="train") # 训练集stride=1以生成大量样本
+    val_dataset = LPWDataset(lpw_root, val_list, seq_len=SEQ_LEN, stride=SEQ_LEN, img_size=(HEIGHT, WIDTH), dataset_type="val") # 验证集stride=SEQ_LEN避免重叠，保证评估独立性
+    # num_workers=4：多进程加载数据，加快I/O；pin_memory=True：将数据锁页在内存，加速GPU传输
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=4, pin_memory=True)
+    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True)
 
     # 初始化模型
     model = PupilTrackerModel(HEIGHT, WIDTH).to(DEVICE)
@@ -148,20 +142,20 @@ if __name__ == "__main__":
     with torch.no_grad():
         _ = model(dummy_input)
 
-    criterion = nn.SmoothL1Loss()
-    optimizer = optim.Adam(model.parameters(), lr=LR)
+    criterion = nn.SmoothL1Loss()   #Huber损失，对离群点鲁棒，适合回归任务
+    optimizer = optim.Adam(model.parameters(), lr=LR)   # Adam优化器
 
-    # 学习率调度器
+    # 学习率调度器，当验证损失停止下降时，学习率乘以factor=0.5，patience=5表示连续5个epoch不降则调整
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
-    scaler = GradScaler()
+    scaler = GradScaler()   # 混合精度训练的梯度缩放器，防止低精度下梯度下溢
     # 添加平滑损失权重
     smooth_weight = 0.1
 
-    # 训练循环
+    # 训练循环，记录最佳验证损失、最佳轮次、当前未改善计数
     best_val_loss = float('inf')
     best_epoch = 0
     patience_counter = 0
-    # 记录训练历史
+    # 保存每轮指标，供后续绘图
     history = {
         'train_loss': [],
         'val_loss': [],
@@ -176,9 +170,8 @@ if __name__ == "__main__":
         total_loss = 0
         total_smooth_loss = 0
 
-        # 替换原来的训练循环内部
         pbar = tqdm.tqdm(train_loader, desc=f"Epoch {epoch + 1}/{NUM_EPOCHS}", leave=False)
-        for batch_x, batch_y in pbar:
+        for batch_x, batch_y in pbar:   # 遍历训练集
             batch_x = batch_x.to(DEVICE, non_blocking=True)
             batch_y = batch_y.to(DEVICE, non_blocking=True)
             optimizer.zero_grad()
@@ -189,6 +182,7 @@ if __name__ == "__main__":
                 detection_loss = criterion(outputs, batch_y)
 
                 if isinstance(model, SmoothPupilTrackerModel):
+                    # 若模型带平滑损失，则额外计算并加权求和
                     smooth_loss = model.smoothness_loss(outputs)
                     total_loss_value = detection_loss + smooth_weight * smooth_loss
                     total_smooth_loss += smooth_loss.item()
@@ -197,8 +191,8 @@ if __name__ == "__main__":
 
             # 缩放梯度反向传播
             scaler.scale(total_loss_value).backward()
-            scaler.step(optimizer)
-            scaler.update()
+            scaler.step(optimizer)  # 更新参数
+            scaler.update()         # 调整缩放因子
 
             total_loss += detection_loss.item()
             # 更新进度条
@@ -213,11 +207,11 @@ if __name__ == "__main__":
         history['train_loss'].append(epoch_loss)
         history['lr'].append(optimizer.param_groups[0]['lr'])
 
-        # 验证
+        # 验证阶段不计算梯度，仅使用检测损失（不加平滑损失）
         model.eval()
         val_loss = 0
         with torch.no_grad():
-            for batch_x, batch_y in val_loader:
+            for batch_x, batch_y in val_loader: # 遍历验证集
                 batch_x = batch_x.to(DEVICE).float()
                 batch_y = batch_y.to(DEVICE).float()
                 outputs = model(batch_x)
