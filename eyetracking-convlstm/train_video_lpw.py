@@ -17,7 +17,9 @@ SEQ_LEN = 20
 BATCH_SIZE = 128
 NUM_EPOCHS = 50
 LR = 0.001
-DEVICE = torch.device("cuda")
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else 'cpu')
+print(f"Using device:{DEVICE}")
+
 
 # 早停配置
 EARLY_STOPPING_PATIENCE = 5         # 验证损失多少个epoch不下降就停止
@@ -119,17 +121,17 @@ if __name__ == "__main__":
     # train_list = "train_files.txt"
     # val_list = "val_files.txt"
 
-    # lpw_root = "/root/cb-convlstm-eyetracking/CloudData/LPW"          # AI galaxy
-    # train_list = "/root/cb-convlstm-eyetracking/eyetracking-convlstm/train_files.txt"
-    # val_list = "/root/cb-convlstm-eyetracking/eyetracking-convlstm/val_files.txt"
+    lpw_root = "/root/cb-convlstm-eyetracking/CloudData/LPW"          # AI galaxy
+    train_list = "/root/cb-convlstm-eyetracking/eyetracking-convlstm/train_files.txt"
+    val_list = "/root/cb-convlstm-eyetracking/eyetracking-convlstm/val_files.txt"
 
-    lpw_root = os.path.join("/kaggle/input/datasets/wakakaele/eyetracking-lpw", "LPW")
-    train_list = os.path.join("/kaggle/input/models/wakakaele/eyetracking/pytorch/default/1", "train_files.txt")
-    val_list = os.path.join("/kaggle/input/models/wakakaele/eyetracking/pytorch/default/1", "val_files.txt")
+    # lpw_root = os.path.join("/kaggle/input/datasets/wakakaele/eyetracking-lpw", "LPW")
+    # train_list = os.path.join("/kaggle/input/models/wakakaele/eyetracking/pytorch/default/1", "train_files.txt")
+    # val_list = os.path.join("/kaggle/input/models/wakakaele/eyetracking/pytorch/default/1", "val_files.txt")
 
     # 创建数据集；stride：采样滑动窗口的步长
-    train_dataset = LPWDataset(lpw_root, train_list, seq_len=SEQ_LEN, stride=1, img_size=(HEIGHT, WIDTH), dataset_type="train") # 训练集stride=1以生成大量样本
-    val_dataset = LPWDataset(lpw_root, val_list, seq_len=SEQ_LEN, stride=SEQ_LEN, img_size=(HEIGHT, WIDTH), dataset_type="val") # 验证集stride=SEQ_LEN避免重叠，保证评估独立性
+    train_dataset = LPWDataset(lpw_root, train_list, seq_len=SEQ_LEN, stride=1, img_size=(HEIGHT, WIDTH), dataset_type="train", preload=True) # 训练集stride=1以生成大量样本
+    val_dataset = LPWDataset(lpw_root, val_list, seq_len=SEQ_LEN, stride=SEQ_LEN, img_size=(HEIGHT, WIDTH), dataset_type="val", preload=True) # 验证集stride=SEQ_LEN避免重叠，保证评估独立性
     # num_workers=4：多进程加载数据，加快I/O；pin_memory=True：将数据锁页在内存，加速GPU传输
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=4, pin_memory=True)
     val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True)
@@ -177,7 +179,7 @@ if __name__ == "__main__":
             optimizer.zero_grad()
 
             # 混合精度训练
-            with autocast():
+            with autocast(device_type = 'cuda'):
                 outputs = model(batch_x)
                 detection_loss = criterion(outputs, batch_y)
 
